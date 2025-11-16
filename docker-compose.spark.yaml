@@ -1,0 +1,34 @@
+services:
+  spark-master:
+    image: my-spark:latest
+    hostname: spark-master
+    ports:
+      - "8081:8080"
+      - "7077:7077"
+    volumes:
+      - ./spark/conf:/opt/spark/conf
+      - ./spark/work-dir:/opt/spark/work-dir
+    command: ["/bin/bash", "-c","/opt/spark/sbin/start-master.sh && tail -f /dev/null"]
+    networks:
+      - lake-house-network
+
+  spark-worker:
+    image: my-spark:latest
+    volumes:
+      - ./spark/conf:/opt/spark/conf
+    command: ["/bin/bash", "-c", "/opt/spark/sbin/start-worker.sh spark://spark-master:7077 && tail -f /dev/null"]
+    networks:
+      - lake-house-network
+
+  spark-connect:
+    image: my-spark:latest
+    ports:
+      - "4040:4040"
+      - "15002:15002"
+    volumes:
+      - ./spark/conf:/opt/spark/conf
+    command: ["/bin/bash", "-c", "/opt/spark/sbin/start-connect-server.sh spark://spark-master:7077 && tail -f /dev/null"]
+    networks:
+      - lake-house-network
+networks:
+  lake-house-network:

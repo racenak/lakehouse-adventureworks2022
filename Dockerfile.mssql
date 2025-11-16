@@ -1,0 +1,22 @@
+# Sử dụng SQL Server trên Ubuntu làm base image
+FROM mcr.microsoft.com/mssql/server:2022-latest
+
+USER root
+RUN apt-get update && apt-get install -y wget unzip
+
+# Tạo thư mục chứa backup
+RUN mkdir -p /var/opt/mssql/backup
+
+# Tải AdventureWorks2022.bak từ GitHub của Microsoft
+RUN wget -O /var/opt/mssql/backup/AdventureWorks2022.bak \
+    https://github.com/Microsoft/sql-server-samples/releases/download/adventureworks/AdventureWorks2022.bak
+
+# Sao chép script restore vào container
+COPY restore-db.sh /usr/src/app/restore-db.sh
+RUN chmod +x /usr/src/app/restore-db.sh
+
+# Mở port SQL Server
+EXPOSE 1433
+
+# Chạy SQL Server và thực hiện restore database
+CMD ["/bin/bash", "-c", "(/opt/mssql/bin/sqlservr &) && sleep 20 && /usr/src/app/restore-db.sh && tail -f /dev/null"]

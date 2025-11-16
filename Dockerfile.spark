@@ -1,0 +1,13 @@
+FROM apache/spark:4.0.0-scala2.13-java17-python3-ubuntu
+
+ADD https://repo1.maven.org/maven2/io/delta/delta-spark_2.13/4.0.0/delta-spark_2.13-4.0.0.jar /opt/spark/jars/delta-spark_2.13-4.0.0.jar
+ADD https://repo1.maven.org/maven2/io/delta/delta-storage/4.0.0/delta-storage-4.0.0.jar /opt/spark/jars/delta-storage-4.0.0.jar
+ADD https://repo1.maven.org/maven2/com/microsoft/sqlserver/mssql-jdbc/13.2.0.jre11/mssql-jdbc-13.2.0.jre11.jar /opt/spark/jars/mssql-jdbc-13.2.0.jre11.jar
+ADD https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.4.1/hadoop-aws-3.4.1.jar /opt/spark/jars/hadoop-aws-3.4.1.jar
+ADD https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/2.25.53/bundle-2.25.53.jar /opt/spark/jars/bundle-2.25.53.jar
+
+USER root
+
+RUN chmod 644 /opt/spark/jars/*.jar && \
+    pip install delta-spark==v4.0.0 --no-deps lxml xmltodict pandas numpy pytz python-dateutil
+USER spark
