@@ -16,7 +16,6 @@ class ExtractLoadTemplate:
     def __init__(self, spark: SparkSession):
         self.spark = spark
         self.spark.conf.set("spark.sql.session.timeZone", "UTC")
-        self.spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED")
     
     def extract_from_jdbc(
         self,

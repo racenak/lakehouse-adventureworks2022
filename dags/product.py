@@ -6,7 +6,6 @@ from pyspark.sql.functions import (
     md5, concat_ws, coalesce, max as spark_max
 )
 from typing import List, Dict
-from delta.tables import DeltaTable
 
 import sys
 sys.path.append('/opt/airflow/dags')
@@ -154,298 +153,225 @@ def product_pipeline():
     @task
     def load_dim_product_scd2():
         """Load dim_product with SCD Type 2 - tracks historical changes"""
+
+        # Configuration
+        DIM_TABLE_NAME = "gold.dim_product"
+        SOURCE_TABLE = "silver.product_enriched"
+        TRACKING_ATTRIBUTES = [
+            "productname", "categoryname", "subcategoryname", "modelname",
+            "color", "size", "sizeunitmeasurecode", "weight", "weightunitmeasurecode",
+            "finishedgoodsflag", "safetystocklevel", "reorderpoint",
+            "standardcost", "listprice", "daystomanufacture",
+            "productline", "class", "style",
+            "sellstartdate", "sellenddate", "discontinueddate"
+        ]
+
         spark = SparkSession.builder.remote("sc://spark-connect:15002").getOrCreate()
-        
+
         try:
-            # Read latest data from silver
-            df_silver = spark.table("silver.product_enriched")
-            
-            # Get the latest record per productkey (in case of multiple ingestion dates)
-            from pyspark.sql.window import Window
-            from pyspark.sql.functions import row_number
-            
+            # Read and deduplicate source data from silver layer
+            df_silver = spark.table(SOURCE_TABLE)
             window = Window.partitionBy("productkey").orderBy(col("ingestion_date").desc())
-            df_latest = df_silver \
-                .withColumn("rn", row_number().over(window)) \
-                .filter(col("rn") == 1) \
+            df_latest = (df_silver
+                .withColumn("rn", row_number().over(window))
+                .filter(col("rn") == 1)
                 .drop("rn", "ingestion_date", "processed_at")
-            
-            # Create hash of attributes that should trigger SCD Type 2 changes
-            # This includes all descriptive attributes but excludes technical fields
-            attribute_cols = [
-                "productname", "categoryname", "subcategoryname", "modelname",
-                "color", "size", "sizeunitmeasurecode", "weight", "weightunitmeasurecode",
-                "finishedgoodsflag", "safetystocklevel", "reorderpoint",
-                "standardcost", "listprice", "daystomanufacture",
-                "productline", "class", "style",
-                "sellstartdate", "sellenddate", "discontinueddate"
-            ]
-            
-            # Create hash column for change detection
-            df_source = df_latest.withColumn(
-                "attribute_hash",
-                md5(concat_ws("|", *[coalesce(col(c).cast("string"), lit("")) for c in attribute_cols]))
             )
-            
+
+            # Add hash column for change detection
+            hash_expr = md5(concat_ws(
+                "|", 
+                *[coalesce(col(c).cast("string"), lit("")) for c in TRACKING_ATTRIBUTES]
+            ))
+            df_with_hash = df_latest.withColumn("attribute_hash", hash_expr)
+
             # Prepare source data with SCD Type 2 columns
             current_date = to_date(current_timestamp())
-            df_source_prepared = df_source \
-                .withColumn("effective_date", current_date) \
-                .withColumn("expiration_date", lit(None).cast("date")) \
+            df_source = (df_with_hash
+                .withColumn("effective_date", current_date)
+                .withColumn("expiration_date", lit(None).cast("date"))
                 .withColumn("is_current", lit(True))
-            
-            # Create or get dim_product table
-            dim_table_name = "gold.dim_product"
-            table_exists = False
-            
+            )
+
+            # Check if dimension table exists
+            table_exists = True
             try:
-                # Try to read existing dim table
-                dim_table = DeltaTable.forName(spark, dim_table_name)
-                table_exists = True
-                print(f"📖 Found existing {dim_table_name} table")
+                spark.table(DIM_TABLE_NAME)
             except Exception:
-                # Table doesn't exist, will create with initial load
-                print(f"📦 {dim_table_name} table does not exist, will create with initial load")
                 table_exists = False
-            
+
+            # Cast to target schema
+            def cast_to_schema(df):
+                return df.select(
+                    col("product_sk").cast(IntegerType()),
+                    col("productkey").cast(IntegerType()),
+                    col("productalternatekey").cast(StringType()),
+                    col("productname").cast(StringType()),
+                    col("categoryname").cast(StringType()),
+                    col("subcategoryname").cast(StringType()),
+                    col("modelname").cast(StringType()),
+                    col("color").cast(StringType()),
+                    col("size").cast(StringType()),
+                    col("sizeunitmeasurecode").cast(StringType()),
+                    col("weight").cast(FloatType()),
+                    col("weightunitmeasurecode").cast(StringType()),
+                    col("finishedgoodsflag").cast(BooleanType()),
+                    col("safetystocklevel").cast(IntegerType()),
+                    col("reorderpoint").cast(IntegerType()),
+                    col("standardcost").cast(FloatType()),
+                    col("listprice").cast(FloatType()),
+                    col("daystomanufacture").cast(IntegerType()),
+                    col("productline").cast(StringType()),
+                    col("class").cast(StringType()),
+                    col("style").cast(StringType()),
+                    col("sellstartdate").cast(TimestampType()),
+                    col("sellenddate").cast(TimestampType()),
+                    col("discontinueddate").cast(TimestampType()),
+                    col("attribute_hash").cast(StringType()),
+                    col("effective_date").cast(DateType()),
+                    col("expiration_date").cast(DateType()),
+                    col("is_current").cast(BooleanType()),
+                    col("created_at").cast(TimestampType()),
+                    col("updated_at").cast(TimestampType())
+                )
+
+            # Initial load if table doesn't exist
             if not table_exists:
-                # Initial load - create table with all records as current
-                from pyspark.sql.functions import row_number
-                from pyspark.sql.window import Window
-                from pyspark.sql.types import FloatType, IntegerType, BooleanType, DateType, TimestampType, StringType
-                
                 window_sk = Window.orderBy("productkey")
-                df_initial = df_source_prepared \
-                    .withColumn("product_sk", row_number().over(window_sk)) \
-                    .withColumn("created_at", current_timestamp()) \
-                    .withColumn("updated_at", current_timestamp()) \
-                    .select(
-                        col("product_sk").cast(IntegerType()).alias("product_sk"),
-                        col("productkey").cast(IntegerType()).alias("productkey"),
-                        col("productalternatekey").cast(StringType()).alias("productalternatekey"),
-                        col("productname").cast(StringType()).alias("productname"),
-                        col("categoryname").cast(StringType()).alias("categoryname"),
-                        col("subcategoryname").cast(StringType()).alias("subcategoryname"),
-                        col("modelname").cast(StringType()).alias("modelname"),
-                        col("color").cast(StringType()).alias("color"),
-                        col("size").cast(StringType()).alias("size"),
-                        col("sizeunitmeasurecode").cast(StringType()).alias("sizeunitmeasurecode"),
-                        col("weight").cast(FloatType()).alias("weight"),  # Explicit cast to REAL/FLOAT
-                        col("weightunitmeasurecode").cast(StringType()).alias("weightunitmeasurecode"),
-                        col("finishedgoodsflag").cast(BooleanType()).alias("finishedgoodsflag"),
-                        col("safetystocklevel").cast(IntegerType()).alias("safetystocklevel"),
-                        col("reorderpoint").cast(IntegerType()).alias("reorderpoint"),
-                        col("standardcost").cast(FloatType()).alias("standardcost"),
-                        col("listprice").cast(FloatType()).alias("listprice"),
-                        col("daystomanufacture").cast(IntegerType()).alias("daystomanufacture"),
-                        col("productline").cast(StringType()).alias("productline"),
-                        col("class").cast(StringType()).alias("class"),
-                        col("style").cast(StringType()).alias("style"),
-                        col("sellstartdate").cast(TimestampType()).alias("sellstartdate"),
-                        col("sellenddate").cast(TimestampType()).alias("sellenddate"),
-                        col("discontinueddate").cast(TimestampType()).alias("discontinueddate"),
-                        col("attribute_hash").cast(StringType()).alias("attribute_hash"),
-                        col("effective_date").cast(DateType()).alias("effective_date"),
-                        col("expiration_date").cast(DateType()).alias("expiration_date"),
-                        col("is_current").cast(BooleanType()).alias("is_current"),
-                        col("created_at").cast(TimestampType()).alias("created_at"),
-                        col("updated_at").cast(TimestampType()).alias("updated_at")
-                    )
-                
-                df_initial.write.format("delta").mode("overwrite").saveAsTable(dim_table_name)
+                df_initial = (df_source
+                    .withColumn("product_sk", row_number().over(window_sk))
+                    .withColumn("created_at", current_timestamp())
+                    .withColumn("updated_at", current_timestamp())
+                )
+
+                df_initial = cast_to_schema(df_initial)
+                df_initial.write.format("delta").mode("overwrite").saveAsTable(DIM_TABLE_NAME)
+
                 initial_count = df_initial.count()
-                print(f"✅ Created {dim_table_name} with {initial_count} records (initial load)")
-                
+                print(f"✅ Created {DIM_TABLE_NAME} with {initial_count} records (initial load)")
+
                 return {
                     "status": "success",
                     "table": "dim_product",
                     "records_inserted": initial_count,
-                    "message": f"✅ Created {dim_table_name} with {initial_count} records (initial load)"
+                    "message": f"✅ Created {DIM_TABLE_NAME} with {initial_count} records (initial load)"
                 }
-            else:
-                # Incremental SCD Type 2 load
-                # Get max product_sk for new records
-                max_sk_result = spark.sql(f"SELECT COALESCE(MAX(product_sk), 0) AS max_sk FROM {dim_table_name}")
-                max_sk = max_sk_result.collect()[0]["max_sk"] if max_sk_result.count() > 0 else 0
-                
-                # Get existing current records with their hash
-                df_existing_current = spark.sql(f"""
-                    SELECT 
-                        productkey, 
-                        COALESCE(attribute_hash, '') AS attribute_hash, 
-                        product_sk
-                    FROM {dim_table_name}
-                    WHERE is_current = true
-                """)
-                
-                # Add hash to existing if not present (for backward compatibility)
-                if "attribute_hash" not in df_existing_current.columns:
-                    # Calculate hash for existing records if needed
-                    df_existing_current = spark.sql(f"""
-                        SELECT 
-                            productkey,
-                            product_sk,
-                            '' AS attribute_hash
-                        FROM {dim_table_name}
-                        WHERE is_current = true
-                    """)
-                
-                # Identify new and changed products
-                df_source_with_hash = df_source_prepared.withColumn(
-                    "source_hash", col("attribute_hash")
+
+            # Incremental load
+            # Get max surrogate key
+            max_sk_result = spark.sql(f"SELECT COALESCE(MAX(product_sk), 0) AS max_sk FROM {DIM_TABLE_NAME}")
+            max_sk = max_sk_result.collect()[0]["max_sk"]
+
+            # Get existing current records
+            df_existing = spark.sql(f"""
+                SELECT 
+                    productkey, 
+                    COALESCE(attribute_hash, '') AS attribute_hash, 
+                    product_sk
+                FROM {DIM_TABLE_NAME}
+                WHERE is_current = true
+            """)
+
+            # Identify new and changed products
+            df_joined = (df_source.alias("source")
+                .join(
+                    df_existing.alias("target"),
+                    col("source.productkey") == col("target.productkey"),
+                    "left"
                 )
-                
-                # Left join to find new products (no match) and changed products (hash mismatch)
-                df_joined = df_source_with_hash.alias("source") \
-                    .join(
-                        df_existing_current.alias("target"),
-                        col("source.productkey") == col("target.productkey"),
-                        "left"
-                    )
-                
-                # Create flags and select only needed columns to avoid ambiguity
-                df_compared = df_joined \
-                    .withColumn("is_new", col("target.productkey").isNull()) \
-                    .withColumn("is_changed", 
-                        (col("target.productkey").isNotNull()) & 
-                        (col("source.attribute_hash") != col("target.attribute_hash"))
-                    ) \
-                    .withColumn("old_product_sk", col("target.product_sk")) \
-                    .select(
-                        # All source columns (use explicit list to avoid duplicates)
-                        col("source.productkey"),
-                        col("source.productalternatekey"),
-                        col("source.productname"),
-                        col("source.categoryname"),
-                        col("source.subcategoryname"),
-                        col("source.modelname"),
-                        col("source.color"),
-                        col("source.size"),
-                        col("source.sizeunitmeasurecode"),
-                        col("source.weight"),
-                        col("source.weightunitmeasurecode"),
-                        col("source.finishedgoodsflag"),
-                        col("source.safetystocklevel"),
-                        col("source.reorderpoint"),
-                        col("source.standardcost"),
-                        col("source.listprice"),
-                        col("source.daystomanufacture"),
-                        col("source.productline"),
-                        col("source.class"),
-                        col("source.style"),
-                        col("source.sellstartdate"),
-                        col("source.sellenddate"),
-                        col("source.discontinueddate"),
-                        col("source.attribute_hash"),
-                        col("source.effective_date"),
-                        col("source.expiration_date"),
-                        col("source.is_current"),
-                        # Computed columns
-                        col("is_new"),
-                        col("is_changed"),
-                        col("old_product_sk")
-                    )
-                
-                # Filter to only new and changed products
-                df_to_process = df_compared.filter(
-                    col("is_new") | col("is_changed")
+            )
+
+            df_compared = (df_joined
+                .withColumn("is_new", col("target.productkey").isNull())
+                .withColumn("is_changed", 
+                    (col("target.productkey").isNotNull()) & 
+                    (col("source.attribute_hash") != col("target.attribute_hash"))
                 )
-                
-                if df_to_process.count() > 0:
-                    # Expire changed products
-                    df_changed = df_to_process.filter(col("is_changed"))
-                    if df_changed.count() > 0:
-                        print(f"🔄 Expiring {df_changed.count()} changed product records")
-                        # Select productkey from source (after join, it's just "productkey" since we dropped target.productkey)
-                        df_changed_for_merge = df_changed.select(
-                            col("productkey"),
-                            col("old_product_sk")
-                        )
-                        dim_table.alias("target").merge(
-                            df_changed_for_merge.alias("source"),
-                            "target.productkey = source.productkey AND target.product_sk = source.old_product_sk AND target.is_current = true"
-                        ).whenMatchedUpdate(
-                            set={
-                                "expiration_date": current_date,
-                                "is_current": lit(False),
-                                "updated_at": current_timestamp()
-                            }
-                        ).execute()
-                    
-                    # Generate product_sk for new records
-                    from pyspark.sql.functions import row_number
-                    from pyspark.sql.window import Window
-                    
-                    # Use explicit column reference to avoid ambiguity
-                    window_sk = Window.orderBy(col("productkey"))
-                    df_with_sk = df_to_process \
-                        .withColumn("rn", row_number().over(window_sk)) \
-                        .withColumn("product_sk", col("rn") + max_sk) \
-                        .drop("rn", "source_hash", "is_new", "is_changed", "old_product_sk")
-                    
-                    # Prepare final insert with all required columns and explicit type casting
-                    from pyspark.sql.types import FloatType, IntegerType, BooleanType, DateType, TimestampType, StringType
-                    
-                    df_to_insert = df_with_sk \
-                        .withColumn("created_at", current_timestamp()) \
-                        .withColumn("updated_at", current_timestamp()) \
-                        .select(
-                            col("product_sk").cast(IntegerType()).alias("product_sk"),
-                            col("productkey").cast(IntegerType()).alias("productkey"),
-                            col("productalternatekey").cast(StringType()).alias("productalternatekey"),
-                            col("productname").cast(StringType()).alias("productname"),
-                            col("categoryname").cast(StringType()).alias("categoryname"),
-                            col("subcategoryname").cast(StringType()).alias("subcategoryname"),
-                            col("modelname").cast(StringType()).alias("modelname"),
-                            col("color").cast(StringType()).alias("color"),
-                            col("size").cast(StringType()).alias("size"),
-                            col("sizeunitmeasurecode").cast(StringType()).alias("sizeunitmeasurecode"),
-                            col("weight").cast(FloatType()).alias("weight"),  # Explicit cast to REAL/FLOAT
-                            col("weightunitmeasurecode").cast(StringType()).alias("weightunitmeasurecode"),
-                            col("finishedgoodsflag").cast(BooleanType()).alias("finishedgoodsflag"),
-                            col("safetystocklevel").cast(IntegerType()).alias("safetystocklevel"),
-                            col("reorderpoint").cast(IntegerType()).alias("reorderpoint"),
-                            col("standardcost").cast(FloatType()).alias("standardcost"),
-                            col("listprice").cast(FloatType()).alias("listprice"),
-                            col("daystomanufacture").cast(IntegerType()).alias("daystomanufacture"),
-                            col("productline").cast(StringType()).alias("productline"),
-                            col("class").cast(StringType()).alias("class"),
-                            col("style").cast(StringType()).alias("style"),
-                            col("sellstartdate").cast(TimestampType()).alias("sellstartdate"),
-                            col("sellenddate").cast(TimestampType()).alias("sellenddate"),
-                            col("discontinueddate").cast(TimestampType()).alias("discontinueddate"),
-                            col("attribute_hash").cast(StringType()).alias("attribute_hash"),
-                            col("effective_date").cast(DateType()).alias("effective_date"),
-                            col("expiration_date").cast(DateType()).alias("expiration_date"),
-                            col("is_current").cast(BooleanType()).alias("is_current"),
-                            col("created_at").cast(TimestampType()).alias("created_at"),
-                            col("updated_at").cast(TimestampType()).alias("updated_at")
-                        )
-                    
-                    # Insert new/changed records
-                    df_to_insert.write.format("delta").mode("append").saveAsTable(dim_table_name)
-                    
-                    inserted_count = df_to_insert.count()
-                    print(f"✅ Loaded {inserted_count} records to {dim_table_name} (SCD Type 2)")
-                    
-                    return {
-                        "status": "success",
-                        "table": "dim_product",
-                        "records_inserted": inserted_count,
-                        "message": f"✅ Loaded {inserted_count} records to {dim_table_name} (SCD Type 2)"
-                    }
-                else:
-                    print("ℹ️ No new or changed products to load")
-                    return {
-                        "status": "no_changes",
-                        "table": "dim_product",
-                        "records_inserted": 0,
-                        "message": "ℹ️ No new or changed products to load"
-                    }
-                
+                .withColumn("old_product_sk", col("target.product_sk"))
+            )
+
+            # Select only source columns
+            source_cols = [col(f"source.{c}").alias(c) for c in df_source.columns]
+            df_compared = df_compared.select(
+                *source_cols,
+                col("is_new"),
+                col("is_changed"),
+                col("old_product_sk")
+            )
+
+            df_to_process = df_compared.filter(col("is_new") | col("is_changed"))
+
+            if df_to_process.count() == 0:
+                print("ℹ️ No new or changed products to load")
+                return {
+                    "status": "no_changes",
+                    "table": "dim_product",
+                    "records_inserted": 0,
+                    "message": "ℹ️ No new or changed products to load"
+                }
+
+            # Expire changed records using temporary view and SQL
+            df_changed = df_to_process.filter(col("is_changed"))
+            if df_changed.count() > 0:
+                print(f"🔄 Expiring {df_changed.count()} changed product records")
+
+                # Create temp view of changed records
+                df_changed.select("productkey", "old_product_sk").createOrReplaceTempView("temp_changed_products")
+
+                # Read current dimension table
+                df_dim = spark.table(DIM_TABLE_NAME)
+
+                # Update records by joining with temp view
+                df_dim_updated = df_dim.alias("dim").join(
+                    spark.table("temp_changed_products").alias("changed"),
+                    (col("dim.productkey") == col("changed.productkey")) &
+                    (col("dim.product_sk") == col("changed.old_product_sk")) &
+                    (col("dim.is_current") == True),
+                    "left"
+                ).select(
+                    col("dim.*"),
+                    col("changed.productkey").alias("matched_key")
+                ).withColumn(
+                    "expiration_date",
+                    when(col("matched_key").isNotNull(), current_date).otherwise(col("dim.expiration_date"))
+                ).withColumn(
+                    "is_current",
+                    when(col("matched_key").isNotNull(), lit(False)).otherwise(col("dim.is_current"))
+                ).withColumn(
+                    "updated_at",
+                    when(col("matched_key").isNotNull(), current_timestamp()).otherwise(col("dim.updated_at"))
+                ).drop("matched_key")
+
+                # Overwrite dimension table with updated records
+                df_dim_updated.write.format("delta").mode("overwrite").option("overwriteSchema", "false").saveAsTable(DIM_TABLE_NAME)
+
+            # Generate surrogate keys for new versions
+            window_sk = Window.orderBy("productkey")
+            df_with_sk = (df_to_process
+                .withColumn("rn", row_number().over(window_sk))
+                .withColumn("product_sk", col("rn") + max_sk)
+                .drop("rn", "is_new", "is_changed", "old_product_sk")
+                .withColumn("created_at", current_timestamp())
+                .withColumn("updated_at", current_timestamp())
+            )
+
+            df_to_insert = cast_to_schema(df_with_sk)
+
+            # Insert new records
+            df_to_insert.write.format("delta").mode("append").saveAsTable(DIM_TABLE_NAME)
+
+            inserted_count = df_to_insert.count()
+            print(f"✅ Loaded {inserted_count} records to {DIM_TABLE_NAME} (SCD Type 2)")
+
+            return {
+                "status": "success",
+                "table": "dim_product",
+                "records_inserted": inserted_count,
+                "message": f"✅ Loaded {inserted_count} records to {DIM_TABLE_NAME} (SCD Type 2)"
+            }
+
         except Exception as e:
             print(f"❌ Error in SCD Type 2 transformation: {str(e)}")
-            import traceback
             traceback.print_exc()
             raise
         finally:
